@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Sample files are too large to puch
+samples/
+
 # Distribution / packaging
 .Python
 build/
