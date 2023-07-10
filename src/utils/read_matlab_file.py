@@ -9,7 +9,8 @@ from src.utils.get_project_root import get_project_root
 
 def read_matlab(path: Union[Path, str, List[Union[Path, str]]]) -> List[Dict]:
     """
-    :param path: path to matlab file
+    read_matlab: read a matlab file
+    :param path: path or list of paths to matlab file or files
     :return: list of dicts
     """
     # Check if it's a single path
