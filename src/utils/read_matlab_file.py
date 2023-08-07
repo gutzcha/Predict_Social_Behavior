@@ -4,8 +4,8 @@ import glob
 from pathlib import Path
 import mat73
 from typing import Dict, Union, List
-from src.utils.get_project_root import get_project_root
-
+from utils.get_project_root import get_project_root
+import scipy
 
 def read_matlab(path: Union[Path, str, List[Union[Path, str]]]) -> List[Dict]:
     """
@@ -23,7 +23,10 @@ def read_matlab(path: Union[Path, str, List[Union[Path, str]]]) -> List[Dict]:
     dict_list = []
     for i, p in enumerate(path):
         if isinstance(p, (Path, str)):
-            mat_dict = mat73.loadmat(p)
+            try:
+                mat_dict = mat73.loadmat(p)
+            except:
+                mat_dict = scipy.io.loadmat(p)
         else:
             raise TypeError(f'All input must be str or Path but input at index {i} was {type(p)}')
         dict_list.append(mat_dict)
