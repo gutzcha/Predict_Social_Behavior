@@ -1,4 +1,4 @@
-from typing import List, Union, Tuple
+from typing import List, Union, Tuple, Any
 from utils.get_project_root import get_project_root
 from utils.read_matlab_file import read_matlab
 import os
@@ -6,78 +6,15 @@ import os.path as osp
 import pandas as pd
 import numpy as np
 import soundfile as sf
-from utils.consts import area_name_to_number_map, area_number_to_name_map
-from utils.helper_functions import downsample_signal, remove_mains_hum
-from scipy.sparse import csr_matrix
-import bisect
+from utils.consts import area_name_to_number_map, area_number_to_name_map, FILES_MAPPING_PATH
+from utils.helper_functions import downsample_signal, remove_mains_hum, compute_time_coherence, \
+    create_binary_list_with_ordered_data, convert_time_stamps_to_frame_numbers, convert_to_numpy_array,\
+    normalize_pose, pose_df_to_matrix, fix_df_col_names
 
 
-# Static functions
-def create_binary_list_with_ordered_data(time_ranges: Union[List, np.ndarray], timestamps: Union[List, np.ndarray],
-                                         dx: float = 0.0) -> np.ndarray:
-    binary_list = np.zeros(len(timestamps), dtype=int)
-    ranges_left = [start_time - dx for start_time, _ in time_ranges]
-
-    for i, timestamp in enumerate(timestamps):
-        index = bisect.bisect_left(ranges_left, timestamp)
-        if index > 0 and timestamp <= time_ranges[index - 1][1] + dx:
-            binary_list[i] = 1
-
-    return binary_list
-
-
-def create_binary_array(time_ranges, sampling_rate, total_length_seconds):
-    total_samples = int(sampling_rate * total_length_seconds)
-    binary_array = np.zeros(total_samples, dtype=int)
-
-    for start_time, end_time in time_ranges:
-        start_index = int(start_time * sampling_rate)
-        end_index = int(end_time * sampling_rate)
-
-        # Clip the indices to ensure they are within the array's bounds
-        start_index = max(start_index, 0)
-        end_index = min(end_index, total_samples)
-
-        binary_array[start_index:end_index] = 1
-
-    return binary_array
-
-
-def convert_to_sparse_array(timestamps, num_timestamps):
-    # Create an empty matrix with the desired shape
-    sparse_array = csr_matrix((1, num_timestamps), dtype=np.int8)
-
-    # Iterate over the timestamps and set the corresponding element to 1
-    for timestamp in timestamps:
-        sparse_array[0, timestamp] = 1
-
-    return sparse_array
-
-
-def convert_to_numpy_array(timestamps, num_timestamps):
-    # Create an empty NumPy array with zeros
-    numpy_array = np.zeros(num_timestamps, dtype=int)
-
-    # Set the corresponding elements to 1 based on the timestamps
-    numpy_array[timestamps] = 1
-
-    return numpy_array
-
-
-def convert_time_stamps_to_frame_numbers(first_array, second_array, dx=0.0001):
-    indices = []
-    for num in first_array:
-        lower_bound = num - dx
-        upper_bound = num + dx
-
-        # Find the indices where the element from the first array would fit
-        lower_idx = np.searchsorted(second_array, lower_bound, side='left')
-        upper_idx = np.searchsorted(second_array, upper_bound, side='right')
-
-        # Add the indices to the list
-        indices.extend(range(lower_idx, upper_idx))
-
-    return indices
+from scipy.signal import coherence
+# debug
+import matplotlib.pyplot as plt
 
 
 class SocialExpSessionBase:
@@ -105,8 +42,10 @@ class SocialExpSessionBase:
         elif file_path.lower().endswith('wav'):
             audio_data, sample_rate = sf.read(file_path)
             return [{'audio_data': audio_data, 'sample_rate': sample_rate}]
-        elif file_path.lower().endswith('xlsx'):
+        elif 'audio excel files' in file_path.lower():
             return [{'audio_usv_data': pd.read_excel(file_path)}]
+        elif "video_pose_estimation" in file_path.lower():
+            return [{'pose_data': pd.read_csv(file_path)}]
         else:
             raise TypeError('Unknown data type')
 
@@ -119,7 +58,7 @@ class SocialExpSessionBase:
         self.trigger_time = trigger_time
 
     def set_stimulus_insertion_time(self, insertion_frame, frame_rate):
-        self.insertion_time = insertion_frame * frame_rate
+        self.insertion_time = insertion_frame / frame_rate
 
 
 class ModalityDataContainer(SocialExpSessionBase):
@@ -138,6 +77,8 @@ class ModalityDataContainer(SocialExpSessionBase):
         """
         super().__init__()
 
+        self._pad_func = None  # How to crop and pad the arrays when extracting data
+        self._crop_func = None
         self.timestamps = timestamps_dict
 
         self.data_dict = data_dict
@@ -148,11 +89,22 @@ class ModalityDataContainer(SocialExpSessionBase):
 
         self.data = self.get_raw_data()
 
+        self.time_dim = -1 # last dim
+
     def get_time_from_ind(self, ind):
         return ind / self.sampling_rate + self.trigger_time
 
     def get_max_range(self):  # TODO Check this later
-        return self.timestamps[-1]
+        return self.timestamps['FramesTimesInSec'][-1]
+
+    def get_adjusted_max_range(self):
+        return self.timestamps['FramesTimesInSec'][-1] - self.trigger_time
+
+    def get_max_range_inds(self):
+        return int(self.sampling_rate * self.get_adjusted_max_range())
+
+    def get_adjusted_max_range_inds(self):
+        return int(self.get_adjusted_max_range()*self.sampling_rate)
 
     def get_raw_data(self):
         raise NotImplemented
@@ -167,18 +119,31 @@ class ModalityDataContainer(SocialExpSessionBase):
 
     def _crop_array(self, array, n_start, n_end=None, crop_func=None):
         def default_crop_func(x, n_start, n_end):
+            if n_end is None or n_end > array.shape[-1]:
+                n_end = array.shape[self.time_dim]
+
             return x[:, int(np.round(n_start)):int(np.round(n_end))]
 
-        if n_end is None or n_end > array.shape[-1]:
-            n_end = array.shape[-1]
         if crop_func is None:
             crop_func = default_crop_func
         return crop_func(x=array, n_start=n_start, n_end=n_end)
+
+    def get_max_freq_range(self):
+        '''
+        get nyquist freq
+        :return:
+        '''
+        return [0, self.sampling_rate / 2]
 
     def get_data_in_range(self, array,
                           time_range: Union[Tuple[Union[float, int], Union[float, int]], Union[float, int]],
                           sampling_rate=None, crop_func=None,
                           pad_func=None):
+        if crop_func is None:
+            crop_func = self._crop_func
+
+        if pad_func is None:
+            pad_func = self._pad_func
 
         if sampling_rate is None:
             sampling_rate = self.sampling_rate
@@ -193,19 +158,25 @@ class ModalityDataContainer(SocialExpSessionBase):
         else:
             raise ValueError(f'time_range must be a tuple of float number of a single float number')
         assert end_time > start_time, f'The second index {end_time} must be greater than the first index {start_time}'
+        n_start = np.round(sampling_rate * start_time)
+        n_end = np.round(sampling_rate * end_time)
+
+        assert n_start < n_end, f'Start index must be smaller than end index'
 
         if start_time >= 0:
             ret = self._crop_array(array=array,
-                                   n_start=sampling_rate * start_time,
-                                   n_end=sampling_rate * end_time, crop_func=crop_func)
+                                   n_start=n_start,
+                                   n_end=n_end, crop_func=crop_func)
         else:
             # The start time is negative meaning we must first pad the array on the left
-            padded_array = self._pad_array(array=array, pad_size=-sampling_rate * start_time, pad_func=pad_func)
+            padded_array = self._pad_array(array=array, pad_size=int(-n_start), pad_func=pad_func)
             new_start_time = 0
             new_end_time = end_time - start_time
+            new_n_start = int(new_start_time * sampling_rate)
+            new_end_end = int(new_end_time * sampling_rate)
             ret = self._crop_array(array=padded_array,
-                                   n_start=sampling_rate * new_start_time,
-                                   n_end=sampling_rate * new_end_time, crop_func=crop_func)
+                                   n_start=new_n_start,
+                                   n_end=new_end_end, crop_func=crop_func)
         return ret
 
     def get_adjusted_for_trigger_time(self, array, trigger_time=None, sampling_rate=None, crop_func=None,
@@ -217,16 +188,23 @@ class ModalityDataContainer(SocialExpSessionBase):
         time_range = trigger_time
         return self.get_data_in_range(array, time_range, sampling_rate=sampling_rate, crop_func=None, pad_func=None)
 
+    def set_attributes(self, **attributes):
+        for attribute, value in attributes.items():
+            setattr(self, attribute, value)
+
 
 class BehavioralDataContainer(ModalityDataContainer):
-    def __init__(self,data_dict: dict, timestamps_dict: dict, trigger_time: Union[float, None] = 0.0, sampling_rate=None):
+    def __init__(self, data_dict: dict, timestamps_dict: dict, trigger_time: Union[float, None] = 0.0,
+                 sampling_rate=None):
         super().__init__(data_dict, timestamps_dict)
 
     def get_raw_data(self):
         data_in = self.data_dict['video_']
 
+
 class USVDataContainer(ModalityDataContainer):
-    def __init__(self, data_dict, timestamps_dict: dict, trigger_time: Union[float, None] = 0.0, sampling_rate=None):
+    def __init__(self, data_dict, timestamps_dict: dict,
+                 trigger_time: Union[float, None] = 0.0, sampling_rate=None):
         self.expand_timestamps_value = 0.05
 
         super().__init__(data_dict, timestamps_dict)
@@ -411,6 +389,7 @@ class LfpDataContainer(ElectroDataContainer):
         # Electrophysiology data
         self.data_dict = data_dict
         self.data_numel = self.data.shape[1]
+        # self.coherence_config = None
 
     def _get_empty_data(self):
         return np.empty((0, self.data_numel))
@@ -429,6 +408,56 @@ class LfpDataContainer(ElectroDataContainer):
 
         norm_sample = (sample - np.mean(sample, axis=1).shape) / np.std(sample, axis=1).shape
         return norm_sample
+
+
+class LfpCoherenceDataContainer:
+    def __init__(self, lfp_object: LfpDataContainer, area1: Union[str, None] = None, area2: Union[str, None] = None,
+                 window_sec: float = 2, overlap_sec: float = 1.9, freq_range: Union[tuple, List, None] = None):
+        self.lfp = lfp_object
+        self.window_sec = window_sec
+        self.overlap_sec = overlap_sec
+        self.freq_range = freq_range
+        self.area1 = None
+        self.area2 = None
+
+    def get_data_in_range(self,
+                          time_range: Union[tuple, List],
+                          area1: str = None, area2: str = None,
+                          window_size: Union[int, None] = None,
+                          overlap_size: Union[int, None] = None,
+                          freq_range: Union[tuple, List, None, str] = None) -> tuple[
+        np.ndarray | tuple[np.ndarray, float | None], Any, Any]:
+
+        if window_size is None:
+            window_size = np.max([np.round(self.lfp.sampling_rate * self.window_sec), 1])
+
+        if overlap_size is None:
+            overlap_size = np.max([np.round(self.lfp.sampling_rate * self.overlap_sec), 1])
+
+        if freq_range is None:
+            freq_range = self.freq_range
+
+        elif isinstance(str, freq_range):
+            if freq_range == 'all':  # get max range 0-nyquist range
+                freq_range = self.lfp.get_max_freq_range()
+        sampling_rate = self.lfp.sampling_rate
+
+        x1 = self.lfp.get_data_in_range(self.lfp.get_channel_by_name(area1), time_range)
+        x2 = self.lfp.get_data_in_range(self.lfp.get_channel_by_name(area2), time_range)
+
+        n_bins = x1.shape[1]
+        if window_size >= n_bins:
+            window_size = np.max([n_bins//2, 2])
+            overlap_size = np.max([int(window_size*0.8), 1])
+
+
+        freq, coh = compute_time_coherence(x=x1, y=x2, segment_length=window_size, overlap_factor=0.95,
+                                           sampling_rate=sampling_rate, window_size=window_size // 2,
+                                           overlap_size=overlap_size // 2)
+        coh = coh.transpose()
+        time_vec = np.linspace(time_range[0], time_range[1], coh.shape[1])
+        # return calculate_coherence(x1, x2, sampling_rate, window_size, freq_range=freq_range)
+        return time_vec, freq, coh
 
 
 class MultiSpikeDataContainer(ElectroDataContainer):
@@ -482,13 +511,94 @@ class MultiSpikeDataContainer(ElectroDataContainer):
         return np.array(ret)
 
 
+class PoseDataContainer(ModalityDataContainer):
+    def __init__(self, data_dict, timestamps_dict: dict,
+                 trigger_time: Union[float, None] = 0.0, sampling_rate=None):
+        self.expand_timestamps_value = 0.05
+
+        super().__init__(data_dict, timestamps_dict)
+        if sampling_rate is None:
+            self.sampling_rate = len(self.timestamps['FramesTimesInSec']) / (self.timestamps['FramesTimesInSec'][-1])
+        else:
+            self.sampling_rate = sampling_rate
+        self.set_stimulus_insertion_time(self.timestamps['StimulusInsertionFrame'], self.sampling_rate)
+        if trigger_time is None:
+            self.trigger_time = self.insertion_time + self.timestamps['StartTriggerTimeInSec']
+        else:
+            self.trigger_time = trigger_time
+
+
+        self.data = self.get_raw_data()
+        self.time_dim = 0
+        self._crop_func = self._get_crop_func
+        self._pad_func = self._get_pad_func
+
+
+
+
+    def get_raw_data(self, labels=None):
+        data_in = self.data_dict['pose_data']
+        return self._get_preprocess_data(data_in)
+
+    def _get_empty_data(self, n):
+        data_shape = list(self.data.shape)
+        data_shape[self.time_dim] = n
+        return np.full(data_shape,np.nan )
+
+    def _get_preprocess_data(self, df_in, labels=None):
+        if len(df_in) == 0:
+            return self._get_empty_data()
+        df_in = fix_df_col_names(df_in)
+        return pose_df_to_matrix(df_in)
+
+    # function to retrieve data
+
+    def _get_crop_func(self, x, n_start, n_end):
+        max_ind = self.get_max_range_inds()
+
+        n_end = int(np.min([n_end, max_ind]))
+        n_start = int(np.min([n_start, n_end]))
+        max_pose_ind = self.data.shape[self.time_dim]
+
+        # the requested range exceeds the avaialble pose
+        if n_start >= max_pose_ind:
+            return self._get_empty_data(n=(n_end-n_start))
+
+        elif n_start < max_pose_ind <= n_end:
+            pad_size = n_end - max_pose_ind
+            x = self._pad_func(x, pad_size, pad_end=True)
+
+
+        return x[n_start:n_end, :, :, :]
+
+    def _get_pad_func(self, array, pad_size, pad_end=False):
+        if pad_end:
+            pad_tuple = (0, pad_size)
+        else:
+            pad_tuple = (pad_size, 0)
+        pad_width = (pad_tuple, (0, 0), (0, 0), (0, 0))
+
+        # Pad the array with NaN values
+        padded_array = np.pad(array, pad_width, mode='constant', constant_values=np.nan)
+        return padded_array
+
+
+
+
+
+
+
+
+
 class SocialExpSession(SocialExpSessionBase):
-    def __init__(self, dict_in: dict):
+    def __init__(self, dict_in: dict, modalities_to_load: list):
         super().__init__()
 
-        self.data_path_dict = dict_in
-        self.modality_options = ['lfp', 'multispike', 'audio', 'usv']  # types of modalities
 
+        self.data_path_dict = dict_in
+        self.modality_options = ['lfp', 'lfp_coherence', 'multispike', 'audio', 'usv', 'pose_data']  # types of modalities
+        self.modalities_to_load = modalities_to_load if modalities_to_load is not None else self.modality_options
+        assert [a in self.modality_options for a in modalities_to_load], f'Invalid modality to load, must me in {self.modality_options} but is was {modalities_to_load} '
         # ================== Set session id parameters =========
         self.rat_num = self.data_path_dict['rat_number']
         self.day_num = self.data_path_dict['day_number']
@@ -499,7 +609,10 @@ class SocialExpSession(SocialExpSessionBase):
         self.probe_name = self.data_path_dict.get('probe_number')
         self.paradigm = self.data_path_dict.get('paradigm')
         self.info_table = self.get_info_table()
+
         # ==================== load data =====================
+
+        self.modalities = {}
 
         # Set timestamp parameters
         self.timestamps = self.load_files('Timestemps')[0]
@@ -513,23 +626,38 @@ class SocialExpSession(SocialExpSessionBase):
         self.stimulus_removal_time = (self.timestamps['StimulusRemovalFrame'].reshape(-1, ) / self.frame_rate)[
                                          0] - self.trigger_time  # check if we need to subtract trigger time
 
-        # Load audio vocalizations analysis file
-        self.usv_data = USVDataContainer(self.load_files('audio excel files')[0],
-                                         self.timestamps, self.trigger_time)
-
+        if 'usv_data' in self.modalities_to_load:
+            # Load audio vocalizations analysis file
+            self.modalities['usv_data'] = USVDataContainer(self.load_files('audio excel files')[0],
+                                                           self.timestamps, self.trigger_time)
+        if 'lfp' in self.modalities_to_load:
         # Load LFP data
-        self.lfp = LfpDataContainer(self.load_files('LFP')[0],
-                                    self.timestamps,
-                                    self.trigger_time)
-        # Load multispike data
-        self.multispikes = MultiSpikeDataContainer(self.load_files('Multispikes')[0],
-                                                   self.timestamps,
-                                                   self.trigger_time)
-        # Load raw audio data
-        self.audio = AudioDataContainer(
-            self.load_files('Audio-wav files', is_audio=True)[0],
-            timestamps_dict=self.timestamps,
-            trigger_time=None)
+            self.modalities['lfp'] = LfpDataContainer(self.load_files('LFP')[0],
+                                                      self.timestamps,self.trigger_time)
+
+        if 'lfp_coherence' in self.modalities_to_load:
+            # Set coherence object
+            self.modalities['lfp_coherence'] = LfpCoherenceDataContainer(self.modalities['lfp'], window_sec=2)
+
+        if 'multispikes' in self.modalities_to_load:
+            # Load multispike data
+            self.modalities['multispikes'] = MultiSpikeDataContainer(self.load_files('Multispikes')[0],
+                                                                     self.timestamps, self.trigger_time)
+        if 'audio' in self.modalities_to_load:
+            # Load raw audio data
+            self.modalities['audio'] = AudioDataContainer(
+                self.load_files('Audio-wav files', is_audio=True)[0],
+                timestamps_dict=self.timestamps,
+                trigger_time=None)
+
+        if 'pose_data' in self.modalities_to_load:
+            # Load pose data
+            self.modalities['pose_data'] = PoseDataContainer(
+                self.load_files('video_pose_estimation')[0],
+                timestamps_dict=self.timestamps,
+                trigger_time=None
+            )
+
 
         # Load behavioral data
         # self.behavioral_data = BehavioralDataContainer(
@@ -548,7 +676,7 @@ class SocialExpSession(SocialExpSessionBase):
 
         if isinstance(area_name, str):
             if area_name == 'all':
-                area_name = self.lfp.recorded_area_names
+                area_name = self.modalities['lfp'].recorded_area_names
             else:
                 area_name = [area_name]
 
@@ -558,30 +686,44 @@ class SocialExpSession(SocialExpSessionBase):
             if modality == 'lfp':
                 vec_dict = {}
                 for area in area_name:
-                    vec_dict[area] = self.lfp.get_data_in_range(self.lfp.get_channel_by_name(area),
-                                                                time_range)
+                    vec_dict[area] = self.modalities['lfp'].get_data_in_range(
+                        self.modalities['lfp'].get_channel_by_name(area),
+                        time_range)
                 dict_to_return['lfp'] = vec_dict
+
+            elif modality == 'lfp_coherence':
+                vec_dict = {}
+                # self.modalities['lfp_coherence']['areas']
+                for area_pair in area_name:
+                    area1, area2 = area_pair
+                    t,f,mat = self.modalities['lfp_coherence'].get_data_in_range(
+                        area1=area1, area2=area2,time_range=time_range, window_size=2000, overlap_size=1980)
+
+                    vec_dict[tuple(area_pair)] = {'time': t, 'freq':f, 'data':mat}
+                dict_to_return['lfp_coherence'] = vec_dict
 
             elif modality == 'multispike':
                 vec_dict = {}
                 for area in area_name:
-                    vec_dict[area] = self.multispikes.get_data_in_range(
-                        self.multispikes.get_channel_by_name(area, method='or'),
+                    vec_dict[area] = self.modalities['multispikes'].get_data_in_range(
+                        self.modalities['multispikes'].get_channel_by_name(area, method='or'),
                         time_range)
                 dict_to_return['multispike'] = vec_dict
+
             elif modality == 'audio':
-                vec = self.audio.get_data_in_range(self.audio.data, time_range)
+                vec = self.modalities['audio'].get_data_in_range(self.modalities['audio'].data, time_range)
                 dict_to_return['audio'] = vec
 
             elif modality == 'usv':
-                vec = self.usv_data.get_data_in_range(self.usv_data.get_raw_data(), time_range)
+                vec = self.modalities['usv_data'].get_data_in_range(self.modalities['usv_data'].get_raw_data(),
+                                                                    time_range)
                 dict_to_return['usv'] = vec
             else:
                 raise KeyError(f'Invalid key {modality}, must be on of {self.modality_options}')
 
         # vec1 = butter_bandpass_filter(data=vec1, lowcut=4.0, highcut=30.0, fs=s_session.lfp.sampling_rate, order=3)
 
-        timestamp_array = self.multispikes.get_data_in_range(
+        timestamp_array = self.modalities['multispikes'].get_data_in_range(
             self.timestamps['FramesTimesInSec'].reshape(1, -1),
             time_range)
 
@@ -610,10 +752,15 @@ class SocialExpSession(SocialExpSessionBase):
         return self.info_table.transpose().to_string()
 
 
+
+
+
+
+
 if __name__ == '__main__':
     # Get list of file names
     # path_to_files = osp.join('..', 'assets', 'session to file mapping reordered.xlsx')
-    path_to_files = osp.join('..', 'assets', 'file_to_session_mapping_20230725.xlsx')
+    path_to_files = FILES_MAPPING_PATH
 
     df = pd.read_excel(path_to_files)
     df = df.loc[df['paradigm'].isin(['free', 'chamber'])]
@@ -622,9 +769,13 @@ if __name__ == '__main__':
     first_line = dict(first_line)
     print(first_line.keys())
 
-    s_session = SocialExpSession(first_line)
+    s_session = SocialExpSession(first_line, modalities_to_load=['pose_data'])
     # vec1 = s_session.lfp.get_adjusted_for_trigger_time(s_session.lfp.get_channel_by_name('CeA'))
     # vec2 = s_session.multispikes.get_adjusted_for_trigger_time(
     #     s_session.multispikes.get_channel_by_name('CeA', method='or'))
-    s_session.load_data_in_range(time_range=(300,350), area_name='all')
+    # t, f, coh = s_session.modalities['lfp_coherence'].get_data_in_range(area1='EA', area2='MeD', time_range=(300, 315))
+    # plt.pcolormesh(t, f, coh)
+    ret = s_session.modalities['pose_data'].get_data_in_range(s_session.modalities['pose_data'].get_raw_data(),  time_range=(317, 319))
+    print(ret.shape)
+    # s_session.load_data_in_range(time_range=(300, 350), area_name='all')
     print(s_session)

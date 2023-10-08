@@ -1,3 +1,6 @@
+import numpy as np
+import os.path as osp
+
 area_number_to_name_map = {
     1:   {'x': -2.4, 'y': 3.18, 'z': -8.5, 'name': 'MeAD', 'description': 'MeAD description'},
     2:   {'x': -3.2, 'y': 3, 'z': -9.10, 'name': 'MePV', 'description': 'MePV medial amygdaloid nucleus, posteroventral part'},
@@ -45,3 +48,35 @@ area_number_to_name_map = {
 area_name_to_number_map = {v['name']: {'x': v['x'], 'y': v['y'], 'z': v['z'], 'description': v['description'], 'number': k} for k, v in area_number_to_name_map.items()}
 
 
+NODES = [
+    'Ear_left',
+    'Ear_right',
+    'Nose',
+    'Neck',
+    'Trunk',
+    'Lateral_right',
+    'Lateral_left',
+    'Tail_base']
+
+NODES2IND = {n:ind for ind,n in enumerate(NODES)}
+
+SKELETON = [
+    ('Neck', 'Ear_left'),
+    ('Neck', 'Ear_right'),
+    ('Neck', 'Nose'),
+    ('Trunk', 'Neck'),
+    ('Trunk', 'Lateral_right'),
+    ('Trunk', 'Lateral_left'),
+    ('Trunk', 'Tail_base')
+]
+
+EDGES = np.array([(NODES2IND[e1], NODES2IND[e2]) for e1, e2 in SKELETON]).reshape(-1,2)
+FILES_MAPPING_PATH = osp.join('..', 'assets', 'file_to_session_mapping_20230930-123448.xlsx')
+#
+# if __name__ == "__main__":
+#     # DEBUG
+#     import pandas as pd
+#     import os
+#     print(os.getcwd())
+#     # df = pd.read_excel(FILES_MAPPING_PATH)
+#     # print(df)

@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from main.session_class import SocialExpSession
 import pandas as pd
 from helper_functions import plot_spectrogram
-
+from utils.consts import FILES_MAPPING_PATH
 
 #
 # def plot_interpolated_arrays(arrays, timestamp_array, names=None):
@@ -29,7 +29,8 @@ from helper_functions import plot_spectrogram
 
 def load_example(ind=0):
     # path_to_files = osp.join('..', 'assets', 'session to file mapping reordered.xlsx')
-    path_to_files = osp.join('..', 'assets', 'file_to_session_mapping_20230725.xlsx')
+    path_to_files = FILES_MAPPING_PATH
+
 
     df = pd.read_excel(path_to_files)
     df = df.loc[df['paradigm'].isin(['free', 'chamber'])]

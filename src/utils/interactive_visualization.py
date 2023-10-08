@@ -9,6 +9,7 @@ import os, sys
 import matplotlib
 # matplotlib.use('TkAgg')
 from main.session_class import SocialExpSession
+from coherence_gui import PlotCoherenceGUI
 
 
 class SelectDialog(tk.Toplevel):
@@ -134,39 +135,51 @@ class PlotApp(tk.Tk):
     def __init__(self, s_session: SocialExpSession):
         super().__init__()
         self.s_session = s_session
-        self.time_range_start = 0
-        self.time_range_end = 10
+        self.time_range_start = 300
+        self.time_range_end = 304
         self.step_size = 1
 
+        # Set coherence gui handle
+        self.coherence_handle = None
+
         self.modality_options = self.s_session.modality_options
-        self.recorded_area_names = self.s_session.lfp.recorded_area_names
+        self.recorded_area_names = self.s_session.modalities['lfp'].recorded_area_names
 
         #  ['lfp', 'multispike', 'audio', 'usv']
 
         # self.area_to_load_default = ['EA', 'Mfb', 'MeD']
-        self.area_to_load_default = self.recorded_area_names
+        self.area_to_load_default = self.recorded_area_names[:1]
+
         self.area_to_load = {a: a in self.area_to_load_default for a in self.recorded_area_names}
 
         # self.modality_plot_dict_list = [
         #     {'modality': 'lfp', 'array': [], 'plot_vector':True, 'plot_spectrogram': True, 'spec_dict':
         #         {'frequency_range': (1, 40), 'nperseg': 128, 'noverlap': 120,
-        #          'sampling_rate': s_session.lfp.sampling_rate}},
+        #          'sampling_rate': s_session.modalities['lfp'].sampling_rate}},
         #     {'modality': 'multispike', 'array': [], 'plot_vector': True, 'plot_spectrogram': False, 'spec_dict': {}},
         #     {'modality': 'audio', 'array': [], 'plot_vector': True, 'plot_spectrogram': True, 'spec_dict':
         #         {'frequency_range': (20000, 80000), 'nperseg': 256, 'noverlap': 200,
-        #                                'sampling_rate': s_session.audio.sampling_rate}},
+        #                                'sampling_rate': s_session.modalities['audio'].sampling_rate}},
         #     {'modality': 'usv', 'array': [], 'plot_vector': True, 'plot_spectrogram': False, 'spec_dict': {}},
         # ]
 
         # debug
         self.modality_plot_dict_list = [
             {'modality': 'lfp', 'array': [], 'plot_vector': False, 'plot_spectrogram': True, 'spec_dict':
-                {'frequency_range': (1, 80), 'nperseg': 512, 'noverlap': 510,
-                 'sampling_rate': s_session.lfp.sampling_rate}},
+                {'frequency_range': (1, 50), 'nperseg': 512, 'noverlap': 510,
+                 'sampling_rate': s_session.modalities['lfp'].sampling_rate}},
+
+            # {'modality': 'lfp_coherence', 'array': [], 'plot_vector': True, 'plot_spectrogram': False, 'areas':[('EA','MeD')]},
+
+
             {'modality': 'multispike', 'array': [], 'plot_vector': False, 'plot_spectrogram': False, 'spec_dict': {}},
+
+
             {'modality': 'audio', 'array': [], 'plot_vector': True, 'plot_spectrogram': False, 'spec_dict':
-                {'frequency_range': (20000, 80000), 'nperseg': 1024, 'noverlap': np.floor(1024*0.7),
-                 'sampling_rate': s_session.audio.sampling_rate}},
+                {'frequency_range': (2000, 80000), 'nperseg': 1024, 'noverlap': np.floor(1024*0.7),
+                 'sampling_rate': s_session.modalities['audio'].sampling_rate}},
+
+
             {'modality': 'usv', 'array': [], 'plot_vector': True, 'plot_spectrogram': False, 'spec_dict': {}},
         ]
         # array_dict: [{modality: 'lfp', array: [vector],  plot_vector: True, plot_spectrogram: True, spec_dict: None}]
@@ -177,7 +190,7 @@ class PlotApp(tk.Tk):
 
         self.title("Plot App")
         # self.geometry("800x600")
-        self.geometry("900x600")
+        self.geometry("1200x600")
 
         self.create_widgets()
 
@@ -188,6 +201,7 @@ class PlotApp(tk.Tk):
         # Top container frame for buttons and text boxes
         top_frame = ttk.Frame(self)
         top_frame.pack(side=tk.TOP, fill=tk.X)
+
 
         # Entry for step size
         step_label = ttk.Button(top_frame, text="Update Step Size:", command=self.update_step_size)
@@ -211,6 +225,7 @@ class PlotApp(tk.Tk):
         # Add two text boxes to set range start and range end
         range_start_label = ttk.Label(top_frame, text="Range Start:")
         range_start_label.pack(side=tk.LEFT, padx=5, pady=5)
+
         self.range_start_entry = ttk.Entry(top_frame, width=5)
         self.range_start_entry.insert(tk.END, str(self.time_range_start))
         self.range_start_entry.pack(side=tk.LEFT, padx=5, pady=5)
@@ -232,6 +247,14 @@ class PlotApp(tk.Tk):
         # Add choose area button
         choose_area_button = ttk.Button(top_frame, text="Choose Areas", command=self.open_area_dialog)
         choose_area_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Add choose coherence pair button
+
+        self.coherence_checkbox_var = tk.BooleanVar(value=False)
+        # self.coherence_checkbox_var.trace_add("write", self.open_coherence_gui)
+        self.choose_coherence_button = tk.Checkbutton(top_frame, text="Choose coherence pair(s)", variable=self.coherence_checkbox_var,
+                                                  command=self.open_coherence_gui)
+        self.choose_coherence_button.pack(side=tk.LEFT, padx=5, pady=5)
 
         # Add stimulus insertion and removal lines state button
         # Not sure what to add here, maybe jump to insertion? or just display the time?
@@ -285,6 +308,18 @@ class PlotApp(tk.Tk):
 
         return n_subplots
 
+
+    def open_coherence_gui(self):
+        if self.coherence_checkbox_var.get():
+            self.coherence_handle = PlotCoherenceGUI(self)
+        else:
+            self.coherence_handle.on_close()
+            self.coherence_handle = None
+
+
+
+
+
     def on_window_resize(self, event):
         # Resize the figure and canvas when the window is resized
         self.plot_canvas.get_tk_widget().configure(width=event.width, height=event.height)
@@ -318,7 +353,7 @@ class PlotApp(tk.Tk):
             self._set_text_box(self.step_entry, self.step_size)
 
     def jump_forward(self):
-        usv_data = self.s_session.usv_data.data_dict['audio_usv_data'][['Begin_Time', 'End_Time']].values
+        usv_data = self.s_session.modalities['usv_data'].data_dict['audio_usv_data'][['Begin_Time', 'End_Time']].values
         usv_data = usv_data[usv_data[:, 0] >= self.time_range_end, :]
         if usv_data.shape[0] == 0:
             return
@@ -351,7 +386,7 @@ class PlotApp(tk.Tk):
 
     def jump_backward(self):
 
-        usv_data = self.s_session.usv_data.data_dict['audio_usv_data'][['Begin_Time', 'End_Time']].values
+        usv_data = self.s_session.modalities['usv_data'].data_dict['audio_usv_data'][['Begin_Time', 'End_Time']].values
         usv_data = usv_data[usv_data[:, 1] <= self.time_range_start, :]
         if usv_data.shape[0] == 0:
             return
@@ -483,6 +518,10 @@ class PlotApp(tk.Tk):
         self.plot_interpolated_arrays(timestamp_array, array_dict, vertical_lines=vertical_lines, subtract_areas=None)
         self.plot_canvas.draw()
 
+        if self.coherence_handle is not None:
+            self.coherence_handle.update_subplots()
+
+
     def on_update_plot(self):
         # Get the entered range values
         try:
@@ -555,7 +594,7 @@ class PlotApp(tk.Tk):
                     # if not subtract_areas is None:
                     #
                     #     vec_sub = array[subtract_areas][0]
-                    #     # vec_sub = remove_mains_hum(vec_sub, sampling_rate=self.s_session.lfp.sampling_rate,
+                    #     # vec_sub = remove_mains_hum(vec_sub, sampling_rate=self.s_session.modalities['lfp'].sampling_rate,
                     #     #                            freq_to_remove=freq_to_remove)
                     #     _, _, spectrogram_data_sub, _ = plot_spectrogram(vec_sub, sampling_rate, freq_range=freq_range,
                     #                                                      window='hann', nperseg=nperseg,
@@ -571,7 +610,7 @@ class PlotApp(tk.Tk):
                         # Use 'spec_params' key to access additional parameters required for spectrogram
                         vec = array_area[0]
                         # if not freq_to_remove is not None:
-                        #     vec = remove_mains_hum(vec, sampling_rate=self.s_session.lfp.sampling_rate,
+                        #     vec = remove_mains_hum(vec, sampling_rate=self.s_session.modalities['lfp'].sampling_rate,
                         #                            freq_to_remove=5)
 
 
